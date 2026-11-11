@@ -1,461 +1,411 @@
-#!/usr/bin/env python3
-"""Deterministic Werewolf agent for make.fun."""
 import hashlib
 import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
+from collections import Counter, defaultdict
+
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+TIMEOUT = 30
 
 
-def canonical(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def post(url, path, payload):
+    data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    req = urllib.request.Request(url.rstrip("/") + path, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with OPENER.open(req, timeout=TIMEOUT) as response:
+        raw = response.read()
+    return json.loads(raw.decode("utf-8"))
 
 
-def fold_text(value):
-    value = re.sub(r"[\r\n\t]+", " ", str(value))
-    value = "".join(ch for ch in value if ord(ch) >= 32 and ord(ch) != 127)
-    return value.strip()
-
-
-def stable_number(seed, game, counter):
-    raw = f"{seed}|{game}|{counter}".encode("utf-8")
-    return int.from_bytes(hashlib.sha256(raw).digest(), "big")
-
-
-def post(url, body, opener, timeout=30):
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with opener.open(request, timeout=timeout) as response:
-        payload = response.read()
-    return json.loads(payload.decode("utf-8"))
-
-
-def alive_players(view):
-    players = view.get("players") or []
-    return sorted(
-        [p for p in players if p.get("alive") is True and isinstance(p.get("seat"), int)],
-        key=lambda p: p["seat"],
-    )
-
-
-def player_map(view):
-    return {p["seat"]: p for p in view.get("players", []) if isinstance(p.get("seat"), int)}
-
-
-def public_roles(view):
-    return {
-        p["seat"]: p.get("role")
-        for p in view.get("players", [])
-        if isinstance(p.get("seat"), int) and p.get("role")
-    }
-
-
-def statement_claims(text, seat_numbers):
-    lowered = text.lower()
-    seer = bool(re.search(r"\b(i am|i'm|im|as) (the )?seer\b|\bseer here\b|\bclaim(?:ing)? seer\b", lowered))
-    claims = []
-    for seat in seat_numbers:
-        names = (rf"(?:seat\s*|player\s*|#)\s*{seat}\b", rf"\b{seat}\b")
-        matched = any(re.search(pattern, lowered) for pattern in names)
-        if not matched:
-            continue
-        if re.search(rf"(?:seat\s*|player\s*|#)?\s*{seat}\b[^.]*\b(?:is|looks|seems)\s+(?:a\s+)?wolf\b", lowered) or re.search(
-            rf"\b(?:wolf|werewolf)\b[^.]*\b(?:seat\s*|player\s*|#)?\s*{seat}\b", lowered
-        ):
-            claims.append((seat, True))
-        elif re.search(rf"(?:seat\s*|player\s*|#)?\s*{seat}\b[^.]*\b(?:is|checked as|came back)\s+(?:not a |non-)?wolf\b", lowered) or re.search(
-            rf"\b(?:clean|innocent|not wolf)\b[^.]*\b{seat}\b", lowered
-        ):
-            claims.append((seat, False))
-    return seer, claims
-
-
-def game_evidence(view):
-    players = player_map(view)
-    seats = sorted(players)
-    roles = public_roles(view)
-    alive = {p["seat"] for p in alive_players(view)}
-    log = view.get("log") or []
-    claims_by = {}
-    accusations = []
-    votes = []
-    for entry in log:
-        if not isinstance(entry, dict):
-            continue
-        kind = entry.get("kind")
-        seat = entry.get("seat")
-        if kind == "speech" and isinstance(seat, int):
-            seer, claims = statement_claims(entry.get("text", ""), seats)
-            record = claims_by.setdefault(seat, {"seer": False, "checks": []})
-            record["seer"] = record["seer"] or seer
-            record["checks"].extend((target, result) for target, result in claims)
-            accusations.extend((seat, target, result, entry.get("day", 0)) for target, result in claims)
-        elif kind == "vote" and isinstance(seat, int) and isinstance(entry.get("target"), int):
-            votes.append((entry.get("day", 0), seat, entry["target"]))
-    score = {seat: 0.0 for seat in seats}
-    trusted_checks = {}
-    seer_claimants = [seat for seat, claim in claims_by.items() if claim["seer"]]
-    for claimant in sorted(seer_claimants):
-        contradictions = any(
-            roles.get(target) is not None and ((roles[target] == "werewolf") != is_wolf)
-            for target, is_wolf in claims_by[claimant]["checks"]
-        )
-        if contradictions:
-            trust = 0.0
-        elif len(seer_claimants) == 1:
-            trust = 0.85
-        else:
-            trust = 0.4
-        if trust >= 0.4:
-            for target, is_wolf in claims_by[claimant]["checks"]:
-                trusted_checks[target] = (is_wolf, trust, claimant)
-        for target, is_wolf in claims_by[claimant]["checks"]:
-            if target in score:
-                score[target] += (3.5 if is_wolf else -2.6) * trust
-        if trust > 0:
-            score[claimant] -= trust * 0.7
-
-    own_seat = (view.get("you") or {}).get("seat")
-    for target in private_seer_wolves(view):
-        if target in score:
-            score[target] += 8.0
-            trusted_checks[target] = (True, 1.0, own_seat)
-    for target in private_seer_clean(view):
-        if target in score:
-            score[target] -= 8.0
-
-    for accuser, target, is_wolf, day in accusations:
-        if target in score and not claims_by.get(accuser, {}).get("seer"):
-            score[target] += 0.42 if is_wolf else -0.12
-    for day, voter, target in votes:
-        if target not in score:
-            continue
-        revealed = roles.get(target)
-        if revealed == "werewolf":
-            score[voter] -= 1.8
-        elif revealed and revealed != "werewolf":
-            score[voter] += 0.18
-
-    for seat in seats:
-        if roles.get(seat) == "werewolf":
-            score[seat] = 100.0
-        elif seat not in alive:
-            score[seat] *= 0.5
-    return {
-        "scores": score,
-        "claims": claims_by,
-        "trusted_checks": trusted_checks,
-        "seer_claimants": sorted(seer_claimants),
-        "roles": roles,
-        "alive": alive,
-        "votes": votes,
-        "accusations": accusations,
-        "players": players,
-        "log": log,
-    }
-
-
-def choose_ranked(candidates, scores, seed, game, counter, high=True):
-    candidates = sorted(set(candidates))
-    if not candidates:
+def stable_pick(items, seed, game, counter=0):
+    if not items:
         return None
-    best = max(scores.get(s, 0.0) for s in candidates) if high else min(scores.get(s, 0.0) for s in candidates)
-    tied = [s for s in candidates if scores.get(s, 0.0) == best]
-    return min(tied, key=lambda s: (stable_number(seed, game, counter + s), s))
+    ordered = sorted(set(items))
+    digest = hashlib.sha256(f"{seed}|{game}|{counter}".encode()).digest()
+    return ordered[int.from_bytes(digest[:8], "big") % len(ordered)]
 
 
-def plurality_target(evidence, candidates, seed, game):
-    vote_counts = {}
-    for _day, _voter, target in evidence["votes"]:
-        vote_counts[target] = vote_counts.get(target, 0) + 1
-    if vote_counts:
-        peak = max(vote_counts.values())
-        leaders = sorted(s for s in candidates if vote_counts.get(s, 0) == peak and peak > 0)
-        if leaders:
-            return leaders[0]
-    return choose_ranked(candidates, evidence["scores"], seed, game, 310, True)
+def players_by_seat(view):
+    result = {}
+    for p in view.get("players", []):
+        if isinstance(p, dict) and isinstance(p.get("seat"), int):
+            result[p["seat"]] = p
+    return result
 
 
-def format_seat(view, seat):
-    player = player_map(view).get(seat, {})
-    name = fold_text(player.get("name", "Unknown"))
+def entry_seat(entry, keys=("seat", "target", "player", "voter", "from")):
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("seat"), int):
+            return value["seat"]
+    return None
+
+
+def event_text(entry):
+    for key in ("text", "statement", "say", "content"):
+        if isinstance(entry.get(key), str):
+            return entry[key]
+    return ""
+
+
+def public_data(view):
+    players = players_by_seat(view)
+    revealed = {}
+    for seat, p in players.items():
+        role = p.get("role")
+        if role:
+            revealed[seat] = str(role).lower()
+    speeches, votes, inspections = [], [], []
+    for e in view.get("log", []):
+        if not isinstance(e, dict):
+            continue
+        kind = str(e.get("kind", "")).lower()
+        if kind in ("speech", "speak", "statement"):
+            speeches.append((entry_seat(e, ("seat", "speaker", "player")), event_text(e), e))
+        elif kind == "vote":
+            votes.append((entry_seat(e, ("seat", "voter", "from")), entry_seat(e, ("target", "vote")), e))
+        elif "inspect" in kind or "check" in kind:
+            inspections.append(e)
+        if kind in ("death", "exile", "reveal", "dawn"):
+            seat = entry_seat(e)
+            role = e.get("role")
+            if seat and role:
+                revealed[seat] = str(role).lower()
+    return players, revealed, speeches, votes, inspections
+
+
+def living_seats(players):
+    return sorted(seat for seat, p in players.items() if p.get("alive", True))
+
+
+def role_is(role, needle):
+    return needle in str(role or "").lower()
+
+
+def claim_analysis(speeches, revealed):
+    claims = defaultdict(list)
+    checks = []
+    for seat, text, event in speeches:
+        if not seat or not text:
+            continue
+        low = text.lower()
+        if re.search(r"\b(i am|i'm|im|claim(?:ing)? to be) (the )?seer\b|\bseer here\b", low):
+            claims[seat].append(event)
+        patterns = [
+            (r"(?:seat\s*)?(\d+)\D{0,32}(?:is|=|looks like|checked as|came back)\s+(?:a )?wolf\b", "wolf"),
+            (r"(?:seat\s*)?(\d+)\D{0,32}(?:is|=|looks|checked as|came back)\s+(?:not a |no |clean|innocent)", "clean"),
+            (r"checked\s+(?:seat\s*)?(\d+)\D{0,24}\b(?:wolf|werewolf)\b", "wolf"),
+            (r"checked\s+(?:seat\s*)?(\d+)\D{0,24}\b(?:clean|innocent|not a wolf)\b", "clean"),
+        ]
+        for pattern, verdict in patterns:
+            for match in re.finditer(pattern, low):
+                target = int(match.group(1))
+                checks.append((seat, target, verdict, event))
+    falsified = {s for s, _, _, _ in checks if revealed.get(s) in ("werewolf", "wolf")}
+    trust = {}
+    claimants = {s for s, _ in claims.items()}
+    for s in claimants:
+        trust[s] = 0.0 if s in falsified else (0.85 if len(claimants) == 1 else 0.4)
+    return claims, checks, trust
+
+
+def format_seat(seat, players):
+    p = players.get(seat, {})
+    name = str(p.get("name", f"Player {seat}"))
     return f"seat {seat} ({name})"
 
 
-def speak_action(view, evidence, seed, game, role):
-    me = view["you"]["seat"]
-    alive = sorted(evidence["alive"] - {me})
-    if role == "werewolf":
-        named_by_seer = any(
-            claimant in evidence["seer_claimants"]
-            and any(target == me for target, _result in record.get("checks", []))
-            for claimant, record in evidence["claims"].items()
-        )
-        if named_by_seer:
-            fabricated = wolf_counterclaim(view, evidence, seed, game)
-            if fabricated:
-                return {"text": fabricated[:480]}
-    for target, (is_wolf, trust, claimant) in sorted(evidence["trusted_checks"].items()):
-        if is_wolf and target in evidence["alive"]:
-            text = f"{format_seat(view, claimant)} claimed a seer check: {format_seat(view, target)} is a wolf. Vote {format_seat(view, target)}."
-            return {"text": text[:480]}
-    known_wolves = sorted(s for s, r in evidence["roles"].items() if r == "werewolf" and s in evidence["alive"])
-    if known_wolves and role != "werewolf":
-        target = known_wolves[0]
-        return {"text": f"{format_seat(view, target)} was revealed as a werewolf. I will vote {format_seat(view, target)}."}
-    if role == "werewolf":
-        partner = (view.get("you", {}).get("partner") or {}).get("seat")
-        candidates = [s for s in alive if s != partner and s not in evidence["roles"]]
-        target = choose_ranked(candidates, evidence["scores"], seed, game, 420, True)
-        if target is None:
-            target = choose_ranked(alive, evidence["scores"], seed, game, 421, True)
-        return {"text": f"We should focus on {format_seat(view, target)}; the current evidence points there."} if target else {"pass": True}
-    target = choose_ranked(alive, evidence["scores"], seed, game, 430, True)
-    if target is None or evidence["scores"].get(target, 0) < 0.5:
-        return {"text": "Let's compare the vote history and specific claims before settling on a target."}
-    return {"text": f"I suspect {format_seat(view, target)}: the claim and vote pattern deserve scrutiny."}
+def clean_speech(text):
+    text = re.sub(r"[\t\r\n\x00-\x1f]+", " ", str(text)).strip()
+    return text[:480]
 
 
-def fabricated_wolf_check(view, evidence, seed, game):
-    me = view["you"]["seat"]
-    choices = sorted(s for s in evidence["alive"] if s != me and s not in evidence["roles"])
-    target = choose_ranked(choices, evidence["scores"], seed, game, 510, True)
+def suspicion_model(view):
+    players, revealed, speeches, votes, _ = public_data(view)
+    me = view.get("you", {}).get("seat")
+    claims, checks, trust = claim_analysis(speeches, revealed)
+    score = {s: 0.0 for s in players}
+    evidence = {s: [] for s in players}
+    for claimant, target, verdict, event in checks:
+        weight = trust.get(claimant, 0.2)
+        if target not in score:
+            continue
+        if verdict == "wolf":
+            score[target] += 3.0 * weight
+            evidence[target].append((1, f"{format_seat(claimant, players)} checked them as a wolf"))
+        else:
+            score[target] -= 1.2 * weight
+    for seat, text, event in speeches:
+        if not seat or seat == me:
+            continue
+        low = text.lower()
+        for target in score:
+            if target == seat:
+                continue
+            name = re.escape(str(players.get(target, {}).get("name", "")).lower())
+            hit = re.search(rf"\b(?:seat\s*)?{target}\b", low) or (name and re.search(rf"\b{name}\b", low))
+            if not hit:
+                continue
+            if re.search(r"\b(wolf|suspect|suspicious|vote|accuse|evil|scum)\b", low):
+                score[target] += 0.35
+                evidence[target].append((2, f"{format_seat(seat, players)} accused them"))
+            if re.search(r"\b(defend|trust|clean|innocent|not a wolf)\b", low):
+                score[target] -= 0.2
+    for voter, target, event in votes:
+        if voter not in score or target not in score:
+            continue
+        target_role = revealed.get(target, "")
+        voter_role = revealed.get(voter, "")
+        if target_role in ("werewolf", "wolf"):
+            score[voter] -= 1.5
+            score[target] += 0.4
+            evidence[voter].append((3, f"voted for revealed wolf {format_seat(target, players)}"))
+        if voter_role in ("werewolf", "wolf") and target_role not in ("werewolf", "wolf"):
+            score[target] += 0.1
+    for claimant, target, verdict, event in checks:
+        if target in score and verdict == "wolf":
+            score[target] += 0.4 * trust.get(claimant, 0.2)
+    for seat, role in revealed.items():
+        if role in ("werewolf", "wolf"):
+            score[seat] = 100.0
+        else:
+            score[seat] = -100.0
+    living = living_seats(players)
+    unknown = [s for s in living if s != me and s not in revealed]
+    ranked = sorted(unknown, key=lambda s: (-score.get(s, 0), s))
+    trusted = sorted((s for s in living if s != me and s not in revealed),
+                     key=lambda s: (score.get(s, 0), s))
+    return {
+        "players": players, "revealed": revealed, "speeches": speeches,
+        "votes": votes, "claims": claims, "checks": checks, "trust": trust,
+        "score": score, "evidence": evidence, "living": living,
+        "unknown": unknown, "ranked": ranked, "trusted": trusted,
+    }
+
+
+def trusted_wolf_claim(data):
+    for claimant in sorted(data["trust"]):
+        if data["trust"][claimant] < 0.5:
+            continue
+        for author, target, verdict, _ in data["checks"]:
+            if author == claimant and verdict == "wolf":
+                if target in data["living"] and target != claimant:
+                    return target
+    for seat, role in data["revealed"].items():
+        if role in ("werewolf", "wolf") and seat in data["living"]:
+            return seat
+    return None
+
+
+def plurality_target(votes, options):
+    counts = Counter(target for _, target, _ in votes if target in options)
+    if not counts:
+        return None
+    max_count = max(counts.values())
+    leaders = sorted(s for s, n in counts.items() if n == max_count)
+    return leaders[0]
+
+
+def safe_target(options, preferred):
+    options = [x for x in options if isinstance(x, int)]
+    if preferred in options:
+        return preferred
+    return options[0] if options else None
+
+
+def statement_for(view, data):
+    me = view.get("you", {}).get("seat")
+    hit = trusted_wolf_claim(data)
+    if hit and hit != me:
+        for claimant, target, verdict, _ in data["checks"]:
+            if target == hit and verdict == "wolf" and data["trust"].get(claimant, 0) >= 0.5:
+                return clean_speech(f"I trust {format_seat(claimant, data['players'])}'s check: {format_seat(hit, data['players'])} is a wolf. Vote there.")
+        return clean_speech(f"{format_seat(hit, data['players'])} was revealed as a wolf. Vote there.")
+    if data["ranked"]:
+        target = data["ranked"][0]
+        reason = data["evidence"].get(target, [])
+        if reason:
+            detail = sorted(reason, key=lambda x: (-x[0], x[1]))[0][1]
+            return clean_speech(f"I'm watching {format_seat(target, data['players'])}: {detail}.")
+        return clean_speech(f"I suspect {format_seat(target, data['players'])}; their votes and claims need an explanation.")
+    return "I have no new information yet; compare claims and voting patterns carefully."
+
+
+def choose_kill(view, data, options, seed, game):
+    you = view.get("you", {})
+    partner = you.get("partner") or {}
+    wolves = {you.get("seat"), partner.get("seat")}
+    eligible = sorted(s for s in options if s not in wolves)
+    seers = [(s, data["trust"].get(s, 0)) for s in data["claims"] if s in eligible]
+    trusted_claims = [s for s, t in seers if t >= 0.5]
+    if trusted_claims:
+        return sorted(trusted_claims)[0]
+    # Shared deterministic ranking: scores are based on the shared log; seat tie-break is stable.
+    low_suspicion = sorted(eligible, key=lambda s: (data["score"].get(s, 0), s))
+    if low_suspicion:
+        return low_suspicion[0]
+    return stable_pick(eligible, seed, game)
+
+
+def fabricate_check(view, data, seed, game):
+    me = view.get("you", {}).get("seat")
+    enemies = [s for s in data["living"] if s != me and s != (view.get("you", {}).get("partner") or {}).get("seat")]
+    target = stable_pick(enemies, seed, game, int(view.get("day", 0)) + 17)
     return target
 
 
-def decision_action(pending, seed):
+def decide(pending, seed):
     game = pending.get("game", 0)
-    kind = pending.get("decision")
-    view = pending.get("view") or {}
-    you = view.get("you") or {}
-    role = you.get("role", "villager")
-    options = pending.get("options") or []
-    options = sorted(s for s in options if isinstance(s, int))
-    evidence = game_evidence(view)
-    if kind == "speak":
-        action = speak_action(view, evidence, seed, game, role)
-        text = fold_text(action.get("text", ""))
-        if not text:
-            return {"game": game, "decision": kind, "pass": True}
-        max_chars = min(500, max(1, int(pending.get("max_chars", 500))))
-        if len(text) > max_chars:
-            text = text[:max_chars]
-        return {"game": game, "decision": kind, "text": text}
-    if not options:
-        return {"game": game, "decision": kind, "target": None}
+    decision = pending.get("decision", "")
+    view = pending.get("view", {})
+    options = pending.get("options", [])
+    you = view.get("you", {})
+    role = str(you.get("role", "")).lower()
     me = you.get("seat")
-    candidates = [s for s in options if s != me]
-    if not candidates:
-        candidates = options[:]
-    target = None
-    if kind == "inspect":
-        rival_claims = [s for s in evidence["seer_claimants"] if s in candidates and s != me]
-        target = choose_ranked(rival_claims, evidence["scores"], seed, game, 610, True)
-        if target is None:
-            unknown = [s for s in candidates if s not in evidence["roles"]]
-            target = choose_ranked(unknown or candidates, evidence["scores"], seed, game, 611, True)
-    elif kind == "protect":
-        trusted_seers = [
-            s for s in evidence["seer_claimants"]
-            if s in candidates and any(claimant == s for _, (_, _, claimant) in evidence["trusted_checks"].items())
-        ]
-        target = choose_ranked(trusted_seers, evidence["scores"], seed, game, 620, False)
-        if target is None:
-            target = choose_ranked(candidates, evidence["scores"], seed, game, 621, False)
-    elif kind == "kill":
-        partner = (you.get("partner") or {}).get("seat")
-        safe = [s for s in candidates if s != partner and evidence["roles"].get(s) != "werewolf"]
-        trusted_claimants = [
-            s for s in evidence["seer_claimants"]
-            if s in safe and evidence["claims"].get(s, {}).get("seer")
-        ]
-        target = choose_ranked(trusted_claimants, evidence["scores"], seed, game, 630, False)
-        if target is None:
-            least_suspected = [s for s in safe if evidence["scores"].get(s, 0.0) <= 0.2]
-            target = choose_ranked(least_suspected or safe, evidence["scores"], seed, game, 631, False)
-        if target is None:
-            target = choose_ranked(candidates, evidence["scores"], seed, game, 632, False)
-    elif kind == "vote":
-        if role == "seer":
-            personally_confirmed = [s for s in private_seer_wolves(view) if s in candidates]
-            if personally_confirmed:
-                target = min(personally_confirmed)
-        for seat, (is_wolf, trust, claimant) in sorted(evidence["trusted_checks"].items()):
-            if target is None and is_wolf and seat in candidates:
-                target = seat
-                break
-        if target is None:
-            revealed_wolves = [s for s in candidates if evidence["roles"].get(s) == "werewolf"]
-            target = min(revealed_wolves) if revealed_wolves else None
-        if target is None and role == "werewolf":
+    data = suspicion_model(view)
+    if decision == "speak":
+        text = statement_for(view, data)
+        if role_is(role, "werewolf") or role_is(role, "wolf"):
+            # Counterclaim a trusted seer accusation with a stable fabricated history.
+            accusation = next((c for c in data["checks"]
+                               if c[1] == me and c[2] == "wolf" and data["trust"].get(c[0], 0) >= 0.5), None)
+            if accusation:
+                target = fabricate_check(view, data, seed, game)
+                if target:
+                    text = clean_speech(f"I'm the seer. I checked {format_seat(target, data['players'])}: clean. The accusation on me is false.")
+        return {"game": game, "decision": "speak", "text": clean_speech(text)}
+    if decision == "kill":
+        return {"game": game, "decision": decision, "target": choose_kill(view, data, options, seed, game)}
+    if decision == "protect":
+        last = view.get("private", {}).get("last_protection")
+        candidates = [s for s in options if s != me and s != last]
+        claimants = [s for s, trust in data["trust"].items() if trust >= 0.5 and s in candidates]
+        preferred = sorted(claimants)[0] if claimants else (data["trusted"][0] if data["trusted"] else None)
+        return {"game": game, "decision": decision, "target": safe_target(candidates, preferred)}
+    if decision == "inspect":
+        rival_claims = [s for s in data["claims"] if s in options and s != me]
+        preferred = sorted(rival_claims)[0] if rival_claims else (data["ranked"][0] if data["ranked"] else None)
+        return {"game": game, "decision": decision, "target": safe_target(options, preferred)}
+    if decision == "vote":
+        hit = trusted_wolf_claim(data)
+        if hit == me or hit not in options:
+            hit = None
+        if hit is None and (role_is(role, "werewolf") or role_is(role, "wolf")):
             partner = (you.get("partner") or {}).get("seat")
-            named_partner = any(
-                candidate == partner and trust >= 0.4
-                for candidate, (_is_wolf, trust, _claimant) in evidence["trusted_checks"].items()
-            )
-            if named_partner:
-                voted = [s for s in candidates if s != partner]
-                tally = {}
-                for _day, _voter, seat in evidence["votes"]:
-                    tally[seat] = tally.get(seat, 0) + 1
-                partner_votes = tally.get(partner, 0)
-                top_other = max((tally.get(s, 0) for s in voted), default=0)
-                if partner_votes > top_other:
-                    target = choose_ranked(voted, evidence["scores"], seed, game, 640, True)
-        if target is None:
-            target = plurality_target(evidence, candidates, seed, game)
-        if target is None:
-            target = choose_ranked(candidates, evidence["scores"], seed, game, 641, True)
-    else:
-        return {"game": game, "decision": kind, "target": None}
-    if target not in options:
-        target = None
-    return {"game": game, "decision": kind, "target": target}
+            partner_named = partner is not None and any(
+                target == partner and verdict == "wolf" and data["trust"].get(author, 0) >= 0.5
+                for author, target, verdict, _ in data["checks"])
+            if partner_named:
+                votes = data["votes"]
+                tally = Counter(target for _, target, _ in votes if target in options)
+                current = plurality_target(votes, options)
+                if current == partner and tally[partner] >= 2:
+                    hit = partner
+        if hit is None:
+            if role_is(role, "werewolf") or role_is(role, "wolf"):
+                partner = (you.get("partner") or {}).get("seat")
+                village = [s for s in data["ranked"] if s != partner]
+                hit = village[0] if village else None
+            else:
+                hit = data["ranked"][0] if data["ranked"] else None
+        return {"game": game, "decision": decision, "target": safe_target(options, hit)}
+    return {"game": game, "decision": decision, "target": None}
 
 
-def process_pending(pending, seed):
-    try:
-        return decision_action(pending, seed)
-    except Exception:
-        game = pending.get("game", 0)
-        kind = pending.get("decision", "vote")
-        if kind == "speak":
-            return {"game": game, "decision": kind, "pass": True}
-        return {"game": game, "decision": kind, "target": None}
+def post_action(url, action):
+    return post(url, "/act", action)
+
+
+def safe_action(pending):
+    game = pending.get("game")
+    decision = pending.get("decision")
+    if decision == "speak":
+        return {"game": game, "decision": "speak", "pass": True}
+    return {"game": game, "decision": decision, "target": None}
 
 
 def run():
+    prompt_path = os.environ.get("MAKEFUN_PROMPT_FILE", "")
+    if not prompt_path:
+        raise RuntimeError("MAKEFUN_PROMPT_FILE is required")
+    with open(prompt_path, "r", encoding="utf-8") as handle:
+        brief = handle.read()
+    # Reading the brief is part of the trial input and makes missing input fail closed.
+    if not brief.strip():
+        raise RuntimeError("the trial brief is empty")
     env_url = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
-    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE", "")
-    if prompt_file:
-        try:
-            with open(prompt_file, "r", encoding="utf-8") as source:
-                source.read()
-        except OSError:
-            pass
     if not env_url:
-        return 0
+        raise RuntimeError("MAKEFUN_ENV_URL is required")
     seed = os.environ.get("MAKEFUN_TRIAL_SEED", "")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     failures = 0
-    while failures < 8:
+    failure_cap = 8
+    answered = set()
+    while True:
         try:
-            observed = post(env_url + "/observe", {}, opener, timeout=25)
+            observed = post(env_url, "/observe", {})
             failures = 0
         except Exception:
             failures += 1
+            if failures >= failure_cap:
+                return
+            time.sleep(0.2 * failures)
             continue
         if not isinstance(observed, dict):
             failures += 1
+            if failures >= failure_cap:
+                return
             continue
         if observed.get("done") is True:
-            return 0
-        pending = observed.get("pending") or []
-        for item in pending:
-            if not isinstance(item, dict):
+            return
+        pending_list = observed.get("pending", [])
+        if not isinstance(pending_list, list):
+            pending_list = []
+        if not pending_list:
+            time.sleep(0.1)
+            continue
+        progressed = False
+        for pending in pending_list:
+            if not isinstance(pending, dict):
                 continue
-            action = process_pending(item, seed)
+            view = pending.get("view", {})
+            log = view.get("log", []) if isinstance(view, dict) else []
+            key = (pending.get("game"), pending.get("decision"), len(log) if isinstance(log, list) else 0)
+            if key in answered:
+                continue
             try:
-                post(env_url + "/act", action, opener, timeout=30)
+                action = decide(pending, seed)
             except Exception:
-                # A transient failure is retried by the next observation if still pending.
-                continue
-    return 0
+                action = safe_action(pending)
+            try:
+                result = post_action(env_url, action)
+                if isinstance(result, dict) and result.get("error") == "not_pending":
+                    answered.add(key)
+                else:
+                    answered.add(key)
+                    progressed = True
+            except Exception:
+                # One legal fallback attempt for a rejected or malformed answer.
+                try:
+                    post_action(env_url, safe_action(pending))
+                    answered.add(key)
+                    progressed = True
+                except Exception:
+                    failures += 1
+                    if failures >= failure_cap:
+                        return
+        if not progressed:
+            time.sleep(0.1)
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(run())
+        run()
     except Exception:
+        # Do not leak an internal exception into the trial output.
         raise SystemExit(0)
-
-
-def wolf_counterclaim(view, evidence, seed, game):
-    """A public-state-only fake seer narrative that repeats consistently within a day."""
-    me = view.get("you", {}).get("seat")
-    day = int(view.get("day", 1) or 1)
-    candidates = sorted(
-        s for s in evidence["alive"]
-        if s != me and evidence["roles"].get(s) != "werewolf"
-    )
-    if not candidates:
-        return None
-    results = []
-    prior_claim = evidence["claims"].get(me, {})
-    for seat, result in prior_claim.get("checks", []):
-        if seat in evidence["players"]:
-            results.append((seat, result))
-    while len(results) <= day:
-        pool = [s for s in candidates if all(old != s for old, _ in results)]
-        if not pool:
-            pool = candidates
-        counter = 700 + len(results)
-        target = choose_ranked(pool, evidence["scores"], seed, game, counter, True)
-        if target is None:
-            break
-        # Fabricated results are stable from public state and the target seat.
-        is_wolf = (stable_number(seed, game, day * 100 + target) % 5 == 0)
-        results.append((target, is_wolf))
-    if not results:
-        return None
-    checked, says_wolf = results[-1]
-    verdict = "a wolf" if says_wolf else "clean"
-    return (
-        f"I claim seer: last night I checked {format_seat(view, checked)} "
-        f"and they came back {verdict}. We should examine that result."
-    )
-
-
-def private_seer_wolves(view):
-    """Return targets personally confirmed as wolves by this seat's seer record."""
-    results = view.get("seerResults")
-    if not isinstance(results, list):
-        return []
-    found = []
-    for record in results:
-        if (
-            isinstance(record, dict)
-            and isinstance(record.get("seat"), int)
-            and record.get("werewolf") is True
-        ):
-            found.append(record["seat"])
-    return sorted(set(found))
-
-
-def private_seer_clean(view):
-    """Return targets personally cleared by this seat's seer record."""
-    results = view.get("seerResults")
-    if not isinstance(results, list):
-        return []
-    found = []
-    for record in results:
-        if (
-            isinstance(record, dict)
-            and isinstance(record.get("seat"), int)
-            and record.get("werewolf") is False
-        ):
-            found.append(record["seat"])
-    return sorted(set(found))
-
-
-def deduplicate_seats(values):
-    result = []
-    seen = set()
-    for value in values:
-        if isinstance(value, int) and value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
-
-
-def final_safe_target(target, options):
-    """Validate a strategy pick against the env's exact legal option list."""
-    if isinstance(target, int) and target in options:
-        return target
-    return None
