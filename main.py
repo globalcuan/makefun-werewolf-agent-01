@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Deterministic Werewolf agent for the make.fun agent/v1 protocol."""
+"""Deterministic Werewolf agent for the make.fun agent/v1 protocol.
+
+Decisions are pure functions of the brief, the available views, and
+MAKEFUN_TRIAL_SEED, so the same inputs always produce the same choices.
+"""
 import hashlib
 import json
 import os
