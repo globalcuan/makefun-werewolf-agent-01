@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Werewolf player for make.fun agent/v1."""
+"""Deterministic Werewolf agent for the make.fun agent/v1 protocol."""
 import hashlib
 import json
 import os
@@ -8,426 +8,381 @@ import sys
 import time
 import urllib.request
 
-LIMIT = 500
-SAFE = 480
+MAX_TEXT = 480
 
 
-def digest(seed, game, label):
-    raw = f"{seed}|{game}|{label}".encode("utf-8")
-    return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")
+def rank_hash(seed, game, purpose):
+    token = f"{seed}|{game}|{purpose}".encode("utf-8")
+    return hashlib.sha256(token).digest()
 
 
-def safe_action(kind):
-    return {"pass": True} if kind == "speak" else {"target": None}
-
-
-class Record:
+class Table:
     def __init__(self, view):
-        self.view = view
-        self.day = view.get("day", 1)
-        you = view.get("you") or {}
+        self.view = view if isinstance(view, dict) else {}
+        you = self.view.get("you") or {}
         self.me = you.get("seat")
         self.role = you.get("role")
-        self.partner = (you.get("partner") or {}).get("seat")
-        self.players = {p.get("seat"): {"name": p.get("name", "?"), "alive": bool(p.get("alive")), "role": p.get("role")}
-                        for p in view.get("players", []) if p.get("seat") is not None}
-        self.results = view.get("seerResults") or []
-        self.protection = view.get("lastProtect") or {}
-        self.wolf_votes = view.get("wolfVotes") or []
-        self.log = view.get("log") or []
-        self.speeches, self.votes, self.dawns, self.exiles = [], [], [], []
-        self.today_votes = []
-        self.mine_turns = 0
-        voting = False
-        for event in self.log:
-            kind, day = event.get("kind"), event.get("day")
+        partner = you.get("partner") or {}
+        self.partner = partner.get("seat")
+        self.day = self.view.get("day", 1)
+        self.people = {}
+        for p in self.view.get("players", []):
+            seat = p.get("seat")
+            if seat is not None:
+                self.people[seat] = {"name": p.get("name", "?"), "alive": bool(p.get("alive")), "role": p.get("role")}
+        self.events = self.view.get("log") or []
+        self.checks = self.view.get("seerResults") or []
+        self.last_guard = self.view.get("lastProtect") or {}
+        self.night_votes = self.view.get("wolfVotes") or []
+        self.talk = []
+        self.votes = []
+        self.today = []
+        self.exits = []
+        self.deaths = []
+        self.my_speaking_turns = 0
+        in_vote = False
+        for e in self.events:
+            kind, d = e.get("kind"), e.get("day")
             if kind == "speech":
-                self.speeches.append((day, event.get("round", 0), event.get("seat"), event.get("text", "")))
-                if day == self.day and event.get("seat") == self.me:
-                    self.mine_turns += 1
-            elif kind == "pass" and day == self.day and event.get("seat") == self.me:
-                self.mine_turns += 1
+                self.talk.append((d, e.get("round", 0), e.get("seat"), e.get("text", "")))
+                if d == self.day and e.get("seat") == self.me:
+                    self.my_speaking_turns += 1
+            elif kind == "pass" and d == self.day and e.get("seat") == self.me:
+                self.my_speaking_turns += 1
+            elif kind == "voting" and d == self.day:
+                in_vote = True
+                self.today = []
             elif kind == "vote":
-                voter, target = event.get("seat"), event.get("target")
-                self.votes.append((day, voter, target))
-                if voting and day == self.day:
-                    self.today_votes.append((voter, target))
-            elif kind == "voting":
-                if day == self.day:
-                    voting, self.today_votes = True, []
+                row = (d, e.get("seat"), e.get("target"))
+                self.votes.append(row)
+                if in_vote and d == self.day:
+                    self.today.append((row[1], row[2]))
             elif kind == "dawn":
-                self.dawns.append((day, event.get("died"), event.get("role")))
+                self.deaths.append((d, e.get("died"), e.get("role")))
             elif kind == "exile":
-                self.exiles.append((day, event.get("seat"), event.get("role")))
+                self.exits.append((d, e.get("seat"), e.get("role")))
 
     def alive(self):
-        return sorted(s for s, p in self.players.items() if p["alive"])
+        return sorted(s for s, p in self.people.items() if p["alive"])
 
-    def role_of(self, seat):
-        return self.players.get(seat, {}).get("role")
+    def role_at(self, seat):
+        return self.people.get(seat, {}).get("role")
 
-    def who(self, seat):
-        p = self.players.get(seat, {})
+    def label(self, seat):
+        p = self.people.get(seat, {})
         return f"seat {seat} ({p.get('name', '?')})"
 
-    def died_day(self, seat):
-        for day, dead, _ in self.dawns:
-            if dead == seat:
-                return day
-        for day, dead, _ in self.exiles:
-            if dead == seat:
+    def dead_on(self, seat):
+        for day, target, _ in self.deaths + self.exits:
+            if seat == target:
                 return day
         return None
 
 
-SEER_CLAIM = re.compile(r"\b(?:i am (?:the )?seer|i'm (?:the )?seer|i claim seer|claiming seer|the seer here)\b", re.I)
-DOCTOR_CLAIM = re.compile(r"\b(?:i am (?:the )?doctor|i'm (?:the )?doctor|i claim doctor)\b", re.I)
-CHECK = re.compile(r"\b(?:checked|checking|inspected|inspect|scanned|peeked|verified)\b", re.I)
-WOLF = re.compile(r"\b(?:werewolf|werewolves|wolf|wolves)\b", re.I)
-NEG = re.compile(r"\b(?:not|never|no)\s+(?:a\s+)?(?:werewolf|wolf)\b|\b(?:isn't|is not)\s+(?:a\s+)?(?:werewolf|wolf)\b", re.I)
-CLEAR = re.compile(r"\b(?:villager|village|innocent|clean|human|town)\b", re.I)
+SEER = re.compile(r"\b(?:i am (?:the )?seer|i'm (?:the )?seer|claim(?:ing)? seer|seer here)\b", re.I)
+DOCTOR = re.compile(r"\b(?:i am (?:the )?doctor|i'm (?:the )?doctor|claim doctor)\b", re.I)
+SCAN = re.compile(r"\b(?:checked|checking|inspected|inspect|scanned|peeked|verified)\b", re.I)
+EVIL = re.compile(r"\b(?:werewolves?|wolves?)\b", re.I)
+NEGATE = re.compile(r"\b(?:not|never|no)\s+(?:a\s+)?(?:werewolf|wolf)\b|\b(?:isn't|is not)\s+(?:a\s+)?(?:werewolf|wolf)\b", re.I)
+GOOD = re.compile(r"\b(?:villager|village|innocent|clean|human|town)\b", re.I)
 
 
-def parse_text(rec, speaker, text):
-    normalized = " " + (text or "").lower() + " "
-    # Name replacement makes both seat references and names usable in evidence.
-    for seat in sorted(rec.players, key=lambda x: (-len(rec.players[x]["name"]), x)):
-        name = rec.players[seat]["name"].lower()
+def parse_statement(table, speaker, text):
+    text = " " + (text or "").lower() + " "
+    for seat in sorted(table.people, key=lambda x: (-len(table.people[x]["name"]), x)):
+        name = table.people[seat]["name"].lower()
         if name:
-            normalized = re.sub(r"(?<!\w)" + re.escape(name) + r"(?!\w)", f" seat{seat} ", normalized)
-    claimed = bool(SEER_CLAIM.search(normalized))
-    doc = bool(DOCTOR_CLAIM.search(normalized))
-    result, opinion = [], []
-    for sentence in re.split(r"[.!?;\n]+", normalized):
-        refs = [int(n) for n in re.findall(r"\bseat\s*(\d+)\b", sentence)]
+            text = re.sub(r"(?<!\w)" + re.escape(name) + r"(?!\w)", f" seat{seat} ", text)
+    is_seer, is_doctor = bool(SEER.search(text)), bool(DOCTOR.search(text))
+    claims, opinions = [], []
+    for sentence in re.split(r"[.!?;\n]+", text):
+        refs = [int(x) for x in re.findall(r"\bseat\s*(\d+)\b", sentence)]
         if not refs:
             continue
-        neg = bool(NEG.search(sentence))
-        haswolf = bool(WOLF.search(sentence)) and not neg
-        hasclear = neg or bool(CLEAR.search(sentence))
-        if haswolf == hasclear:
+        neg = bool(NEGATE.search(sentence))
+        says_wolf = bool(EVIL.search(sentence)) and not neg
+        says_clear = neg or bool(GOOD.search(sentence))
+        if says_wolf == says_clear:
             continue
-        verdict = haswolf
-        bucket = result if claimed or CHECK.search(sentence) else opinion
-        bucket.extend((seat, verdict) for seat in refs if seat != speaker and seat in rec.players)
-    return claimed, doc, result, opinion
+        bucket = claims if is_seer or SCAN.search(sentence) else opinions
+        bucket.extend((s, says_wolf) for s in refs if s in table.people and s != speaker)
+    return is_seer, is_doctor, claims, opinions
 
 
-class Inference:
-    def __init__(self, rec, seed, game):
-        self.rec = rec
-        self.seed = seed
-        self.game = game
+class Beliefs:
+    def __init__(self, table, seed, game):
+        self.t, self.seed, self.game = table, seed, game
         self.claimants = {}
-        self.doctors = set()
-        self.claim_results = {}
+        self.checks = {}
         self.opinions = []
-        for day, _round, speaker, text in rec.speeches:
-            if speaker not in rec.players:
+        for day, _, speaker, words in table.talk:
+            if speaker not in table.people:
                 continue
-            seer, doctor, results, opinions = parse_text(rec, speaker, text)
-            if seer:
+            claimed, _, checks, opinions = parse_statement(table, speaker, words)
+            if claimed:
                 self.claimants.setdefault(speaker, day)
-            if doctor:
-                self.doctors.add(speaker)
-            if seer or speaker in self.claimants:
-                self.claim_results.setdefault(speaker, []).extend((s, w, day) for s, w in results)
-            self.opinions.extend((speaker, s, w, day) for s, w in opinions)
-        self.trust = self._trust()
-        self.suspicion = self._scores()
+            if claimed or speaker in self.claimants:
+                self.checks.setdefault(speaker, []).extend((target, wolf, day) for target, wolf in checks)
+            self.opinions.extend((speaker, target, wolf, day) for target, wolf in opinions)
+        self.cred = self._credibility()
+        self.suspicion = self._suspicion()
 
-    def _trust(self):
-        out = {}
-        for claimant in sorted(self.claimants):
-            role = self.rec.role_of(claimant)
-            if role is not None:
-                out[claimant] = 1.0 if role == "seer" else 0.0
+    def _credibility(self):
+        trust = {}
+        for speaker in sorted(self.claimants):
+            known = self.t.role_at(speaker)
+            if known is not None:
+                trust[speaker] = 1.0 if known == "seer" else 0.0
                 continue
-            contradicted = any((wolf and self.rec.role_of(s) not in (None, "werewolf")) or
-                               (not wolf and self.rec.role_of(s) == "werewolf")
-                               for s, wolf, _ in self.claim_results.get(claimant, []))
-            out[claimant] = 0.0 if contradicted else (0.85 if len(self.claimants) == 1 else 0.4)
-        if self.rec.role == "seer":
-            for claimant in out:
-                if claimant != self.rec.me:
-                    out[claimant] = 0.0
-        return out
+            contradicted = any((wolf and self.t.role_at(target) not in (None, "werewolf")) or
+                               (not wolf and self.t.role_at(target) == "werewolf")
+                               for target, wolf, _ in self.checks.get(speaker, []))
+            trust[speaker] = 0.0 if contradicted else (0.85 if len(self.claimants) == 1 else 0.4)
+        if self.t.role == "seer":
+            for speaker in trust:
+                if speaker != self.t.me:
+                    trust[speaker] = 0.0
+        return trust
 
-    def best_claim(self):
-        vals = [(weight, -seat, seat) for seat, weight in self.trust.items()
-                if seat != self.rec.me and weight >= 0.4]
-        return max(vals)[2] if vals else None
+    def top_claim(self):
+        possible = [s for s, v in self.cred.items() if s != self.t.me and v >= 0.4]
+        return max(possible, key=lambda s: (self.cred[s], -s)) if possible else None
 
-    def claimed_score(self, seat):
-        score = 0.0
-        for claimant, results in self.claim_results.items():
-            weight = self.trust.get(claimant, 0.0)
-            for target, wolf, _ in results:
-                if target == seat:
-                    score += weight if wolf else -weight
-        return score
+    def reported_wolf(self, seat):
+        return any(target == seat and wolf and self.cred.get(speaker, 0) > 0
+                   for speaker, rows in self.checks.items() for target, wolf, _ in rows)
 
-    def _scores(self):
-        scores = {s: 0.0 for s in self.rec.players}
-        for claimant, results in self.claim_results.items():
-            weight = self.trust.get(claimant, 0.0)
-            for seat, wolf, _ in results:
-                if seat in scores:
-                    scores[seat] += weight * (3.0 if wolf else -2.0)
-        # Public voting behavior is evaluated once roles become known.
-        for day, voter, target in self.rec.votes:
-            if target is None or voter not in scores:
+    def _suspicion(self):
+        score = {s: 0.0 for s in self.t.people}
+        for speaker, rows in self.checks.items():
+            for target, wolf, _ in rows:
+                score[target] += self.cred.get(speaker, 0) * (3 if wolf else -2)
+        for _, voter, target in self.t.votes:
+            if target is None or voter not in score:
                 continue
-            revealed = self.rec.role_of(target)
-            if revealed == "werewolf":
-                scores[voter] -= 1.5
-            elif revealed is not None:
-                scores[voter] += 0.8
-            if revealed is not None and revealed != "werewolf" and self.rec.role_of(voter) == "werewolf":
-                scores[voter] -= 0.8
-        for speaker, target, accused, _day in self.opinions:
-            role = self.rec.role_of(target)
+            role = self.t.role_at(target)
+            if role == "werewolf":
+                score[voter] -= 1.5
+            elif role is not None:
+                score[voter] += 0.8
+            if role is not None and role != "werewolf" and self.t.role_at(voter) == "werewolf":
+                score[voter] -= 0.8
+        for speaker, target, accused, _ in self.opinions:
+            role = self.t.role_at(target)
             if role is None:
                 continue
-            if accused and role == "werewolf":
-                scores[speaker] -= 1.0
-            elif accused:
-                scores[speaker] += 0.6
-            elif role == "werewolf":
-                scores[speaker] += 1.4
+            if accused:
+                score[speaker] += -1.0 if role == "werewolf" else 0.6
             else:
-                scores[speaker] -= 0.4
-        spoke = {speaker for _, _, speaker, _ in self.rec.speeches}
-        if self.rec.day >= 2:
-            for seat in scores:
-                if seat != self.rec.me and seat not in spoke and self.rec.players[seat]["alive"]:
-                    scores[seat] += 0.4
-        return scores
+                score[speaker] += 1.4 if role == "werewolf" else -0.4
+        spoken = {s for _, _, s, _ in self.t.talk}
+        if self.t.day >= 2:
+            for s in score:
+                if s != self.t.me and self.t.people[s]["alive"] and s not in spoken:
+                    score[s] += 0.4
+        return score
 
-    def pick(self, candidates, scores=None, exclude=(), label="choice"):
-        eligible = [s for s in candidates if s != self.rec.me and s not in exclude]
-        if not eligible:
+    def choose(self, candidates, inverted=False, purpose="pick"):
+        rows = [s for s in candidates if s != self.t.me]
+        if not rows:
             return None
-        values = self.suspicion if scores is None else scores
-        return max(eligible, key=lambda s: (values.get(s, 0.0), -digest(self.seed, self.game, f"{label}:{s}"), -s))
+        def key(s):
+            h = rank_hash(self.seed, self.game, f"{purpose}:{s}")
+            return ((-1 if inverted else 1) * self.suspicion.get(s, 0), h, -s)
+        return max(rows, key=key)
 
 
-def decide(seed, game, view, kind, pending):
-    rec = Record(view)
-    intel = Inference(rec, seed, game)
-    opts = [x for x in (pending.get("options") or []) if x in rec.players]
-    if kind == "speak":
-        statement = speak(rec, intel)
-        return {"text": statement} if statement else {"pass": True}
-    if kind == "inspect":
-        return {"target": inspect(rec, intel, opts)}
-    if kind == "protect":
-        return {"target": protect(rec, intel, opts)}
-    if kind == "kill":
-        return {"target": kill(rec, intel, opts)}
-    if kind == "vote":
-        return {"target": wolf_vote(rec, intel, opts) if rec.role == "werewolf" else village_vote(rec, intel, opts)}
-    return safe_action(kind)
+def action(seed, game, view, decision, pending):
+    t = Table(view)
+    b = Beliefs(t, seed, game)
+    opts = [s for s in (pending.get("options") or []) if s in t.people]
+    if decision == "speak":
+        line = statement(t, b)
+        return {"text": line} if line else {"pass": True}
+    if decision == "inspect":
+        seen = {x.get("seat") for x in t.checks}
+        fresh = [s for s in opts if s not in seen]
+        rivals = [s for s in b.claimants if s in fresh]
+        return {"target": min(rivals) if rivals else b.choose(fresh, purpose="inspect")}
+    if decision == "protect":
+        last = t.last_guard.get("seat")
+        trusted = b.top_claim()
+        if trusted in opts and trusted != last:
+            return {"target": trusted}
+        pool = [s for s in opts if s != last] or opts
+        return {"target": b.choose(pool, inverted=True, purpose="protect")}
+    if decision == "kill":
+        pool = [s for s in opts if s != t.partner]
+        if not pool:
+            return {"target": None}
+        for v in t.night_votes:
+            if v.get("seat") == t.partner and v.get("night") == t.day and v.get("target") in pool:
+                return {"target": v["target"]}
+        claimants = [s for s in b.claimants if s in pool]
+        if claimants:
+            return {"target": max(claimants, key=lambda s: (b.cred.get(s, 0), -s))}
+        return {"target": b.choose(pool, inverted=True, purpose="kill")}
+    if decision == "vote":
+        pool = [s for s in opts if s != t.me and (t.role != "werewolf" or s != t.partner)]
+        if t.role == "werewolf":
+            counts = {}
+            for _, target in t.today:
+                if target is not None:
+                    counts[target] = counts.get(target, 0) + 1
+            partner_count = counts.get(t.partner, 0)
+            rival_max = max((n for s, n in counts.items() if s != t.partner), default=0)
+            claimed_partner = t.partner is not None and b.reported_wolf(t.partner)
+            if t.partner in opts and claimed_partner and partner_count >= 2 and partner_count >= rival_max:
+                return {"target": t.partner}
+            return {"target": b.choose(pool, purpose="wolfvote")}
+        sure = [s for s in pool if b.suspicion.get(s, 0) >= 100]
+        if sure:
+            return {"target": min(sure)}
+        if t.role == "seer":
+            found = [x.get("seat") for x in t.checks if x.get("werewolf") and x.get("seat") in pool]
+            if found:
+                return {"target": found[0]}
+        claimed = b.top_claim()
+        if claimed is not None:
+            found = [s for s, wolf, _ in b.checks.get(claimed, []) if wolf and s in pool]
+            if found:
+                return {"target": found[-1]}
+        preferred = b.choose(pool, purpose="vote")
+        tally = {}
+        for _, target in t.today:
+            if target in pool:
+                tally[target] = tally.get(target, 0) + 1
+        if tally and preferred is not None:
+            lead = max(tally, key=lambda s: (tally[s], -s))
+            if tally[lead] >= 2 and b.suspicion.get(lead, 0) >= b.suspicion.get(preferred, 0) - 1.5:
+                preferred = lead
+        return {"target": preferred}
+    return {"target": None}
 
 
-def inspect(r, i, options):
-    prior = {x.get("seat") for x in r.results}
-    fresh = [s for s in options if s not in prior]
-    rivals = [s for s in i.claimants if s in fresh and s != r.me]
-    return min(rivals) if rivals else i.pick(fresh, label="inspect")
+def evidence(t, b, target):
+    for _, voter, voted in t.votes:
+        if voter == target and voted is not None and t.role_at(voted) not in (None, "werewolf"):
+            return f"{t.label(target)} voted out {t.label(voted)}, who was village"
+    for speaker, accused, wolf, _ in b.opinions:
+        if speaker == target and not wolf and t.role_at(accused) == "werewolf":
+            return f"{t.label(target)} defended {t.label(accused)}, a revealed wolf"
+    if t.day >= 2 and not any(s == target for _, _, s, _ in t.talk):
+        return f"{t.label(target)} has barely spoken"
+    return f"{t.label(target)}'s record deserves scrutiny"
 
 
-def protect(r, i, options):
-    previous = r.protection.get("seat")
-    seer = i.best_claim()
-    if seer in options and seer != previous:
-        return seer
-    scores = {s: -i.suspicion.get(s, 0.0) for s in options}
-    if previous in options:
-        options = [s for s in options if s != previous] or options
-    return i.pick(options, scores=scores, label="protect")
-
-
-def kill(r, i, options):
-    options = [s for s in options if s != r.partner]
-    if not options:
-        return None
-    for vote in r.wolf_votes:
-        if vote.get("seat") == r.partner and vote.get("night") == r.day and vote.get("target") in options:
-            return vote["target"]
-    claimants = [s for s in i.claimants if s in options]
-    if claimants:
-        return max(claimants, key=lambda s: (i.trust.get(s, 0), -s))
-    return i.pick(options, scores={s: -i.suspicion.get(s, 0) for s in options}, label="kill")
-
-
-def village_vote(r, i, options):
-    options = [s for s in options if s != r.me]
-    if r.role == "seer":
-        for found in r.results:
-            if found.get("werewolf") and found.get("seat") in options:
-                return found["seat"]
-    sure = [s for s in options if i.suspicion.get(s, 0) >= 100]
-    if sure:
-        return min(sure)
-    trusted = i.best_claim()
-    if trusted is not None:
-        named = [s for s, wolf, _ in i.claim_results.get(trusted, []) if wolf and s in options]
-        if named:
-            return named[-1]
-    top = i.pick(options, label="vote")
-    tally = {}
-    for _, target in r.today_votes:
-        if target in options:
-            tally[target] = tally.get(target, 0) + 1
-    plurality = sorted(tally, key=lambda s: (-tally[s], s))
-    if plurality and tally[plurality[0]] >= 2 and top is not None and i.suspicion.get(plurality[0], 0) >= i.suspicion.get(top, 0) - 1.5:
-        return plurality[0]
-    return top
-
-
-def wolf_vote(r, i, options):
-    options = [s for s in options if s not in (r.me, r.partner)]
-    partner_alive = any(p.get("seat") == r.partner and p.get("alive") for p in r.view.get("players", []))
-    if partner_alive and r.partner is not None:
-        counts = {}
-        for _, target in r.today_votes:
-            if target is not None:
-                counts[target] = counts.get(target, 0) + 1
-        partner_votes = counts.get(r.partner, 0)
-        largest_other = max((count for seat, count in counts.items() if seat != r.partner), default=0)
-        trusted = i.best_claim()
-        named_partner = trusted is not None and any(
-            seat == r.partner and wolf for seat, wolf, _ in i.claim_results.get(trusted, [])
-        )
-        if named_partner and partner_votes >= 2 and partner_votes >= largest_other:
-            return r.partner
-    return i.pick(options, label="wolf-vote")
-
-
-def evidence(r, i, target):
-    for _, voter, voted in r.votes:
-        if voter == target and voted is not None:
-            role = r.role_of(voted)
-            if role is not None and role != "werewolf":
-                return f"{r.who(target)} voted out {r.who(voted)}, who was village"
-    for speaker, accused, is_wolf, _ in i.opinions:
-        if speaker == target and not is_wolf and r.role_of(accused) == "werewolf":
-            return f"{r.who(target)} defended {r.who(accused)}, a revealed wolf"
-    if r.day >= 2 and not any(s == target for _, _, s, _ in r.speeches):
-        return f"{r.who(target)} has barely spoken"
-    return f"{r.who(target)}'s record deserves scrutiny"
-
-
-def my_check_text(r):
-    return "; ".join(f"night {x.get('night', 0)} I checked {r.who(x.get('seat'))}: {'werewolf' if x.get('werewolf') else 'not a werewolf'}" for x in r.results)
-
-
-def speak(r, i):
-    round_no = r.mine_turns + 1
-    found = next((x.get("seat") for x in r.results if x.get("werewolf") and r.players.get(x.get("seat"), {}).get("alive")), None) if r.role == "seer" else None
-    rivals = [s for s in i.claimants if s != r.me]
-    if r.role == "seer":
-        checks = my_check_text(r)
-        if found is not None:
-            return trim(f"I am the seer. My checks: {checks}. Vote {r.who(found)} today." + (f" {r.who(rivals[0])} is falsely claiming seer." if rivals else ""))
+def statement(t, b):
+    turn = t.my_speaking_turns + 1
+    alive_wolf_check = next((x.get("seat") for x in t.checks
+                             if x.get("werewolf") and t.people.get(x.get("seat"), {}).get("alive")), None) if t.role == "seer" else None
+    rivals = [s for s in b.claimants if s != t.me]
+    if t.role == "seer":
+        checks = "; ".join(f"night {x.get('night', 0)} I checked {t.label(x.get('seat'))}: {'werewolf' if x.get('werewolf') else 'not a werewolf'}" for x in t.checks)
+        if alive_wolf_check is not None:
+            tail = f" {t.label(rivals[0])} is falsely claiming seer." if rivals else ""
+            return fit(f"I am the seer. My checks: {checks}. Vote {t.label(alive_wolf_check)} today.{tail}")
         if rivals:
-            return trim(f"I am the real seer; {r.who(rivals[0])} is lying. My checks: {checks}.")
-        if r.day >= 3 and checks:
-            return trim(f"I am the seer. My checks so far: {checks}.")
-    if r.role == "werewolf":
-        accused = i.claimed_score(r.me) >= 0.4 or (r.partner is not None and i.claimed_score(r.partner) >= 0.4)
-        others = [s for s in i.claimants if s not in (r.me, r.partner)]
-        if accused and others and r.me not in i.claimants:
-            checks = []
-            nights = list(range(1, r.day)) or [1]
+            return fit(f"I am the real seer; {t.label(rivals[0])} is lying. My checks: {checks}.")
+        if t.day >= 3 and checks:
+            return fit(f"I am the seer. My checks so far: {checks}.")
+    if t.role == "werewolf":
+        accused = b.reported_wolf(t.me) or (t.partner is not None and b.reported_wolf(t.partner))
+        bluffers = [s for s in b.claimants if s not in (t.me, t.partner)]
+        if accused and bluffers and t.me not in b.claimants:
+            target = bluffers[0]
+            nights = list(range(1, t.day)) or [1]
+            fake = []
             for night in nights:
                 if night == nights[-1]:
-                    checks.append(f"night {night} I checked {r.who(others[0])}: werewolf")
+                    fake.append(f"night {night} I checked {t.label(target)}: werewolf")
                 else:
-                    candidates = [s for s in sorted(r.players) if s not in (r.me, r.partner, others[0])
-                                  and (r.died_day(s) is None or r.died_day(s) >= night)]
-                    if candidates:
-                        chosen = candidates[digest(i.seed, i.game, f"counter-check:{night}") % len(candidates)]
-                        checks.append(f"night {night} I checked {r.who(chosen)}: not a werewolf")
-            fake = "; ".join(checks)
-            return trim(f"I am the seer. My checks: {fake}. Vote {r.who(others[0])}.")
-    trusted = i.best_claim()
+                    choices = [s for s in sorted(t.people) if s not in (t.me, t.partner, target) and
+                               (t.dead_on(s) is None or t.dead_on(s) >= night)]
+                    if choices:
+                        selected = choices[int.from_bytes(rank_hash(b.seed, b.game, f"bluff:{night}")[:4], "big") % len(choices)]
+                        fake.append(f"night {night} I checked {t.label(selected)}: not a werewolf")
+            return fit(f"I am the seer. My checks: {'; '.join(fake)}. Vote {t.label(target)}.")
+    trusted = b.top_claim()
     if trusted is not None:
-        names = [s for s, wolf, _ in i.claim_results.get(trusted, []) if wolf and r.players.get(s, {}).get("alive")]
-        if names:
-            return trim(f"{r.who(trusted)}, our seer, named {r.who(names[-1])} as a wolf. We should vote there.")
-    pool = [s for s in r.alive() if s not in (r.me, r.partner)]
-    target = i.pick(pool, label="speech")
+        targets = [s for s, wolf, _ in b.checks.get(trusted, []) if wolf and t.people.get(s, {}).get("alive")]
+        if targets:
+            return fit(f"{t.label(trusted)}, our seer, named {t.label(targets[-1])} as a wolf. We should vote there.")
+    pool = [s for s in t.alive() if s not in (t.me, t.partner)]
+    target = b.choose(pool, purpose="speech")
     if target is None:
         return None
-    lead = "My main suspicion" if round_no <= 1 else "I will vote"
-    return trim(f"{lead} is {r.who(target)}: {evidence(r, i, target)}.")
+    start = "My main suspicion" if turn <= 1 else "I will vote"
+    return fit(f"{start} is {t.label(target)}: {evidence(t, b, target)}.")
 
 
-def trim(text):
-    # Keep one-line text and within both platform and our conservative cap.
-    text = re.sub(r"\s+", " ", text).strip()[:SAFE]
-    # Python slices Unicode code points, matching the env's statement counter.
-    return text
+def fit(text):
+    return re.sub(r"\s+", " ", text).strip()[:MAX_TEXT]
 
 
-class Player:
-    def __init__(self, url, seed):
-        self.url = url.rstrip("/")
-        self.seed = seed
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def safe(decision):
+    return {"pass": True} if decision == "speak" else {"target": None}
+
+
+class Runner:
+    def __init__(self):
+        self.url = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
+        self.seed = os.environ.get("MAKEFUN_TRIAL_SEED", "")
+        self.http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def post(self, route, body):
-        request = urllib.request.Request(self.url + route, data=json.dumps(body, separators=(",", ":")).encode(),
-                                         headers={"content-type": "application/json"}, method="POST")
-        with self.opener.open(request, timeout=60) as response:
+        req = urllib.request.Request(self.url + route, data=json.dumps(body, separators=(",", ":")).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with self.http.open(req, timeout=60) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
 
     def run(self):
+        failed_polls = 0
         while True:
             try:
-                status, observation = self.post("/observe", {})
+                status, packet = self.post("/observe", {})
             except Exception:
+                failed_polls += 1
+                if failed_polls >= 5:
+                    return
                 time.sleep(1)
                 continue
             if status != 200:
+                failed_polls += 1
+                if failed_polls >= 5:
+                    return
                 time.sleep(1)
                 continue
-            if observation.get("done"):
-                break
-            for pending in observation.get("pending", []):
-                self.answer(pending)
-
-    def answer(self, pending):
-        game, kind, view = pending.get("game"), pending.get("decision"), pending.get("view")
-        if game is None or kind is None or view is None:
-            return
-        try:
-            action = decide(self.seed, game, view, kind, pending)
-        except Exception:
-            action = safe_action(kind)
-        body = {"game": game, "decision": kind, **action}
-        try:
-            status, _ = self.post("/act", body)
-            if status != 200:
-                self.post("/act", {"game": game, "decision": kind, **safe_action(kind)})
-        except Exception:
-            # Re-observation will reveal whether the action was accepted.
-            return
+            failed_polls = 0
+            if packet.get("done"):
+                return
+            for item in packet.get("pending", []):
+                game, decision, view = item.get("game"), item.get("decision"), item.get("view")
+                if game is None or decision is None or view is None:
+                    continue
+                try:
+                    choice = action(self.seed, game, view, decision, item)
+                except Exception:
+                    choice = safe(decision)
+                body = {"game": game, "decision": decision, **choice}
+                try:
+                    status, _ = self.post("/act", body)
+                    if status != 200:
+                        self.post("/act", {"game": game, "decision": decision, **safe(decision)})
+                except Exception:
+                    pass
 
 
 def main():
     prompt = os.environ.get("MAKEFUN_PROMPT_FILE", "")
     if prompt:
         try:
-            with open(prompt, "r", encoding="utf-8") as handle:
-                handle.read()
+            with open(prompt, "r", encoding="utf-8") as stream:
+                stream.read()
         except OSError:
             pass
-    url = os.environ.get("MAKEFUN_ENV_URL", "")
-    if url:
-        Player(url, os.environ.get("MAKEFUN_TRIAL_SEED", "")).run()
+    if os.environ.get("MAKEFUN_ENV_URL"):
+        Runner().run()
     return 0
 
 
